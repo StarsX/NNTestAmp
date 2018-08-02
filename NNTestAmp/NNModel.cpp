@@ -3,12 +3,13 @@
 //--------------------------------------------------------------------------------------
 
 #include "NNModel.h"
-#include "Common\amp_vector_math.h"
+//#include "Common\amp_vector_math.h"
 #include <iostream>
 #include <cassert>
 
 using namespace std;
 using namespace concurrency;
+using namespace precise_math;
 
 NNModel::NNModel(uint32_t uLayerCount) :
 	m_uLayerCount(uLayerCount),
@@ -101,6 +102,16 @@ void NNModel::SetKernels(const vector<vector<float>> &vvWeights, const vector<ve
 		SetKernel(i, vvWeights[i], vvBias[i], vKernelSizes[i], vStrides.empty() ? 2 : vStrides[i]);
 }
 
+void NNModel::SetMaxPools(const int *pSizes)
+{
+	for (auto i = 0u; i < m_uLayerCount - 1; ++i) SetMaxPool(i, pSizes[i]);
+}
+
+void NNModel::SetMaxPools(const vector<int> &vSizes)
+{
+	SetMaxPools(vSizes.data());
+}
+
 void NNModel::SetFeatureMap(uint32_t i, int iWidth, int iHeight, int iNum)
 {
 	m_vFeatureMaps[i] = make_shared<AmpImage2DArray<float>>(iNum, iHeight, iWidth);
@@ -135,15 +146,25 @@ void NNModel::SetKernel(uint32_t i, const vector<float> &vWeights, const vector<
 	SetKernel(i, vWeights.data(), vBias.data(), iKernelSize, uStride);
 }
 
+void NNModel::SetMaxPool(uint32_t i, int iSize)
+{
+	const auto iNum = m_vFeatureMaps[i]->get_extent()[0];
+	const auto iHeight = m_vFeatureMaps[i]->get_extent()[1] / iSize;
+	const auto iWidth = m_vFeatureMaps[i]->get_extent()[2] / iSize;
+
+	m_vMaxPools[i] = make_shared<AmpImage2DArray<float>>(iNum, iHeight, iWidth);
+	m_layerData[i].m_uMaxPoolSize = iSize;
+}
+
 void NNModel::Execute()
 {
 	for (auto i = 0u; i < m_uLayerCount; ++i) ExecuteLayer(i);
 }
 
-void NNModel::ExecuteLayer(uint32_t i)
+void NNModel::ExecuteLayer(uint32_t i, bool bMaxPool)
 {
 	auto& iNeuronsRW = *m_vFeatureMaps[i];
-	const auto ivNeuronsRO = AmpImage2DArrayView<float>(*(i > 0 ? m_vFeatureMaps[i - 1] : m_pImages));
+	const auto ivNeuronsRO = AmpImage2DArrayView<float>(*(i > 0 ? (bMaxPool ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages));
 
 	const auto ivWeights = AmpImage2DArrayView<float>(*m_vWeights[i]);
 	const auto avBias = AmpArrayView<float>(*m_vBias[i]);
@@ -156,31 +177,39 @@ void NNModel::ExecuteLayer(uint32_t i)
 		// Define the compute domain, which is the set of threads that are created.
 		iNeuronsRW.extent,
 		// Define the code to run on each thread on the accelerator.
-		[=, &iNeuronsRW](const AmpIndex3D idx) restrict(amp)
+		[=, &iNeuronsRW](const index<3> idx) restrict(amp)
 	{
-		const auto vWinPos = AmpIndex3D(idx * uStride);
+		const auto vWinPos = index<3>(idx * uStride);
 
 		auto fResult = avBias[idx[0]];
 
 		for (auto i = 0u; i < uImageCount; ++i)
 		{
+			// Convolution
 			for (auto j = 0u; j < uKernelSize; ++j)
 			{
 				for (auto k = 0u; k < uKernelSize; ++k)
 				{
-					const auto vCKPos = AmpIndex3D(idx[0] * uImageCount + i, j, k);
+					const auto vCKPos = index<3>(idx[0] * uImageCount + i, j, k);
 					const auto vPos = vWinPos + vCKPos;
-					const auto vNPos = AmpIndex3D(i, vPos[1], vPos[2]);
+					const auto vNPos = index<3>(i, vPos[1], vPos[2]);
 					fResult += ivNeuronsRO[vNPos] * ivWeights[vCKPos];
 				}
 			}
 		}
 
-		fResult = 1.7159f * precise_math::tanhf(fResult * 2.0f / 3.0f);
+		// Activation function
+		fResult = 1.7159f * tanh(fResult * 2.0f / 3.0f);
 
 		iNeuronsRW[idx] = fResult;
 	}
 	);
+}
+
+void NNModel::MaxPool(uint32_t i)
+{
+	if (m_layerData[i].m_uMaxPoolSize == 2) maxPool2x2(i);
+	// else maxPool(i);
 }
 
 void NNModel::PrintLayerData()
@@ -196,4 +225,35 @@ void NNModel::PrintLayerData()
 vector<float> NNModel::GetResult() const
 {
 	return *m_vFeatureMaps[m_uLayerCount - 1];
+}
+
+void NNModel::maxPool2x2(uint32_t i)
+{
+	auto& iNeuronsRW = *m_vMaxPools[i];
+	const auto ivNeuronsRO = AmpImage2DArrayView<float>(*m_vFeatureMaps[i - 1]);
+
+	// Fast 2x2 down sampling with max-filter
+	parallel_for_each(
+		// Define the compute domain, which is the set of threads that are created.
+		ivNeuronsRO.extent.tile<1, 2, 2>(),
+		// Define the code to run on each thread on the accelerator.
+		[=, &iNeuronsRW](const tiled_index<1, 2, 2> t_idx) restrict(amp)
+	{
+		// Group (tile)-shared memory
+		tile_static float fPool[2][2];
+		auto &fPoolCur = fPool[t_idx.local[1]][t_idx.local[2]];
+
+		fPoolCur = ivNeuronsRO[t_idx];
+		t_idx.barrier.wait();
+
+		// Take max in binary
+		fPoolCur = t_idx.local[2] ? fmax(fPoolCur, fPool[t_idx.local[1]][t_idx.local[2] - 1]) : fPoolCur;
+		fPoolCur = t_idx.local[1] ? fmax(fPoolCur, fPool[t_idx.local[1] - 1][t_idx.local[2]]) : fPoolCur;
+
+		if (t_idx.local[1] && t_idx.local[2])
+		{
+			iNeuronsRW[t_idx.tile] = fPoolCur;
+		}
+	}
+	);
 }

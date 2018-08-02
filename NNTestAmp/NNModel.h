@@ -5,10 +5,8 @@
 #pragma once
 
 #include <amp.h>  
-#include <amp_graphics.h>
+//#include <amp_graphics.h>
 #include <amp_math.h>
-
-using AmpIndex3D = concurrency::index<3>;
 
 template<typename T>
 using AmpImage2DArray = concurrency::array<T, 3>;
@@ -68,15 +66,20 @@ public:
 	void SetKernels(const std::vector<std::vector<float>> &vvWeights, const std::vector<std::vector<float>> &vvBias,
 		const std::vector<int> &vKernelSizes, const std::vector<int> &vStrides = std::vector<int>(0));
 
+	void SetMaxPools(const int *pSizes);
+	void SetMaxPools(const std::vector<int> &vSizes);
+
 	void SetFeatureMap(uint32_t i, int uiWidth, int iHeight, int iNum);
 	void SetKernel(uint32_t i, spAmpImage2DArray<float> &pImgWeights, spAmpArray<float> &pImgBias);
 	void SetKernel(uint32_t i, const float *pWeights, const float *pBias,
 		int iKernelSize, uint32_t uStride = 2);
 	void SetKernel(uint32_t i, const std::vector<float> &vWeights, const std::vector<float> &vBias,
 		int iKernelSize, uint32_t uStride = 2);
+	void SetMaxPool(uint32_t i, int iSize);
 
 	void Execute();
-	void ExecuteLayer(uint32_t i);
+	void ExecuteLayer(uint32_t i, bool bMaxPool = false);
+	void MaxPool(uint32_t i);
 
 	void PrintLayerData();
 
@@ -87,12 +90,17 @@ protected:
 	{
 		uint32_t m_uStride = 2;
 		uint32_t m_uKernelSize;
+		uint32_t m_uMaxPoolSize;
 		
 		uint32_t m_uImageCount = 1;	// Input image count (number of input image/neurons from the previous layer)
 		uint32_t m_uMapCount;
 	};
 
+	void maxPool(uint32_t i);
+	void maxPool2x2(uint32_t i);
+
 	vpAmpImage2DArray<float>	m_vFeatureMaps;
+	vpAmpImage2DArray<float>	m_vMaxPools;
 
 	vpAmpImage2DArray<float>	m_vWeights;
 	vpAmpArray<float>			m_vBias;
