@@ -93,16 +93,9 @@ int main()
 		1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
 	};
 
-	const NNModel::FeatureMapInfo vMapInfo[] =
-	{
-		NNModel::FeatureMapInfo { 6, 13, 13 },
-		NNModel::FeatureMapInfo { 50, 5, 5 },
-		NNModel::FeatureMapInfo { 100, 1, 1 },
-		NNModel::FeatureMapInfo { 10, 1, 1 }
-	};
-
+	const int pFeatureMapCounts[] = { 6, 50, 100, 10 };
 	const int pKernelSizes[] = { 5, 5, 5, 1 };
-	const uint32_t pStrides[] = { 2, 2, 0, 0 };
+	const uint32_t pStrides[] = { 2, 2, 1, 1 };
 
 	vector<float> pvWeights[uLayers];
 	vector<float> pvBias[uLayers];
@@ -111,7 +104,7 @@ int main()
 	{
 		const string szFileName = "lw" + to_string(i + 1) + ".wei";
 		if (!readKernel(pvWeights[i], pvBias[i], szFileName.c_str(), pKernelSizes[i] * pKernelSizes[i],
-			i > 0 ? vMapInfo[i - 1].m_uNum : 1, vMapInfo[i].m_uNum))
+			i > 0 ? pFeatureMapCounts[i - 1] : 1, pFeatureMapCounts[i]))
 		{
 			cout << "Failed to read file " << szFileName << "!" << endl;
 			system("pause");
@@ -123,8 +116,7 @@ int main()
 	// Start CNN model
 	NNModel model(uLayers);
 	model.SetInputImages(input, 29, 29);
-	model.SetFeatureMaps(vMapInfo);
-	model.SetKernels(pvWeights, pvBias, pKernelSizes, pStrides);
+	model.SetLayers(pvWeights, pvBias, pFeatureMapCounts, pKernelSizes, pStrides);
 
 	model.PrintLayerData();
 	model.Execute();
