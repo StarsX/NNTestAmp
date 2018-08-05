@@ -270,10 +270,9 @@ void NNModel::Convolution(uint32_t i)
 	const auto uStride = m_layerData[i].m_uStride;
 	const auto uKernelSize = m_layerData[i].m_uKernelSize;
 	const auto uImageCount = m_layerData[i].m_uImageCount;
-	const auto uMaxPoolSize = i > 0 ? m_layerData[i - 1].m_uMaxPoolSize : 1;
 
 	auto &iNeuronsRW = *m_vFeatureMaps[i];
-	const auto &iNeuronsRO = *(i > 0 ? (uMaxPoolSize > 1 ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages);
+	const auto &iNeuronsRO = *(i > 0 ? (m_layerData[i - 1].m_uMaxPoolSize > 1 ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages);
 
 	const auto &iWeights = *m_vWeights[i];
 	const auto &aBias = *m_vBias[i];
@@ -437,7 +436,7 @@ vector<float> NNModel::GetResult() const
 
 int2 NNModel::calculateFeatureMapSizeFromKernel(uint32_t i, int iKernelSize, uint32_t uStride) const
 {
-	const auto &pImage = i > 0 ? m_vFeatureMaps[i - 1] : m_pImages;
+	const auto &pImage = i > 0 ? (m_layerData[i - 1].m_uMaxPoolSize > 1 ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages;
 	const auto iHeight = (pImage->get_extent()[1] - iKernelSize) / uStride + 1;
 	const auto iWidth = (pImage->get_extent()[2] - iKernelSize) / uStride + 1;
 
@@ -449,7 +448,7 @@ void NNModel::maxPool(uint32_t i)
 	const auto uMaxPoolSize = m_layerData[i].m_uMaxPoolSize;
 
 	auto& iNeuronsRW = *m_vMaxPools[i];
-	const auto &iNeuronsRO = *m_vFeatureMaps[i - 1];
+	const auto &iNeuronsRO = *m_vFeatureMaps[i];
 
 	// nxn down sampling with max-filter
 	parallel_for_each(
@@ -481,7 +480,7 @@ void NNModel::maxPool(uint32_t i)
 void NNModel::maxPool2x2(uint32_t i)
 {
 	auto& iNeuronsRW = *m_vMaxPools[i];
-	const auto &iNeuronsRO = *m_vFeatureMaps[i - 1];
+	const auto &iNeuronsRO = *m_vFeatureMaps[i];
 
 	// Fast 2x2 down sampling with max-filter
 	parallel_for_each(
