@@ -44,13 +44,15 @@ void NNModel::SetInputImages(const vector<float> &vImages, int iWidth, int iHeig
 	m_layerData[0].m_uImageCount = iNum;
 }
 
-void NNModel::SetGroundTruths(spAmpImage2DArray<float>& pImgResults)
+void NNModel::SetGroundTruths(spAmpImage2DArray<float> &pImgResults)
 {
 	m_pGroundTruths = pImgResults;
 }
 
 void NNModel::SetGroundTruths(const float *pResults, int iWidth, int iHeight, int iNum)
 {
+	if (m_uLayerCount < 1) return;
+
 	const auto i = m_uLayerCount - 1;
 	iNum = iNum > 0 ? iNum : m_vFeatureMaps[i]->get_extent()[0];
 	iHeight = iHeight > 0 ? iHeight : m_vFeatureMaps[i]->get_extent()[1];
@@ -89,14 +91,14 @@ void NNModel::SetLayers(const float *const *ppWeights, const float *const *ppBia
 		SetLayer(i, ppWeights[i], ppBias[i], pNumFeatureMaps[i], pKernelSizes[i], pStrides ? pStrides[i] : 2);
 }
 
-void NNModel::SetLayers(const vector<const float*>& vpWeights, const vector<const float*>& vpBias,
+void NNModel::SetLayers(const vector<const float*> &vpWeights, const vector<const float*> &vpBias,
 	const int *pNumFeatureMaps, const int *pKernelSizes, const uint32_t *pStrides)
 {
 	SetLayers(vpWeights.data(), vpBias.data(), pNumFeatureMaps, pKernelSizes, pStrides);
 }
 
 void NNModel::SetLayers(const vector<vector<float>> &vvWeights, const vector<vector<float>> &vvBias,
-	const vector<int>& vNumFeatureMaps, const std::vector<int>& vKernelSizes, const std::vector<int>& vStrides)
+	const vector<int> &vNumFeatureMaps, const std::vector<int> &vKernelSizes, const std::vector<int> &vStrides)
 {
 	for (auto i = 0u; i < m_uLayerCount; ++i)
 		SetLayer(i, vvWeights[i], vvBias[i], vNumFeatureMaps[i], vKernelSizes[i], vStrides.empty() ? 2 : vStrides[i]);
@@ -181,7 +183,7 @@ void NNModel::SetKernels(const vector<vector<float>> &vvWeights, const vector<ve
 
 void NNModel::SetMaxPools(const int *pSizes)
 {
-	for (auto i = 0u; i < m_uLayerCount - 1; ++i) SetMaxPool(i, pSizes[i]);
+	for (auto i = 0u; i + 1 < m_uLayerCount; ++i) SetMaxPool(i, pSizes[i]);
 }
 
 void NNModel::SetMaxPools(const vector<int> &vSizes)
@@ -262,7 +264,38 @@ void NNModel::SetMaxPool(uint32_t i, int iSize)
 
 void NNModel::Execute()
 {
-	for (auto i = 0u; i < m_uLayerCount; ++i) Convolution(i);
+	for (auto i = 0u; i < m_uLayerCount; ++i)
+	{
+		Convolution(i);
+		MaxPool(i);
+	}
+}
+
+void NNModel::BackPropagate(float fEta)
+{
+	if (m_uLayerCount < 1) return;
+
+	// Evaluate the errors(dE / dy) for the final layer
+	const auto i = m_uLayerCount - 1;
+	auto &idEdysRW = *m_vdEdys[i];
+	const auto &iNeuronsRO = *m_vFeatureMaps[i];
+	const auto &iGroundTruthsRO = *m_pGroundTruths;
+
+	parallel_for_each(
+		// Define the compute domain, which is the set of threads that are created.
+		idEdysRW.extent,
+		// Define the code to run on each thread on the accelerator.
+		[=, &idEdysRW, &iNeuronsRO, &iGroundTruthsRO](const index<3> idx) restrict(amp)
+	{
+		const auto fx = iNeuronsRO[idx];
+		const auto fdEdx = fx - iGroundTruthsRO[idx];
+
+		idEdysRW[idx] = (1.0f - fx * fx) * fdEdx;
+	}
+	);
+
+	// Back propagate
+	for (auto i = 0u; i < m_uLayerCount; ++i) BackConvolution(i, fEta);
 }
 
 void NNModel::Convolution(uint32_t i)
@@ -274,18 +307,18 @@ void NNModel::Convolution(uint32_t i)
 	auto &iNeuronsRW = *m_vFeatureMaps[i];
 	const auto &iNeuronsRO = *(i > 0 ? (m_layerData[i - 1].m_uMaxPoolSize > 1 ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages);
 
-	const auto &iWeights = *m_vWeights[i];
-	const auto &aBias = *m_vBias[i];
+	const auto &iWeightsRO = *m_vWeights[i];
+	const auto &aBiasRO = *m_vBias[i];
 
 	parallel_for_each(
 		// Define the compute domain, which is the set of threads that are created.
 		iNeuronsRW.extent,
 		// Define the code to run on each thread on the accelerator.
-		[=, &iNeuronsRW, &iNeuronsRO, &iWeights, &aBias](const index<3> idx) restrict(amp)
+		[=, &iNeuronsRW, &iNeuronsRO, &iWeightsRO, &aBiasRO](const index<3> idx) restrict(amp)
 	{
 		const auto vWinPos = index<2>(idx[1], idx[2]) * uStride;
 
-		auto fResult = aBias[idx[0]];
+		auto fResult = aBiasRO[idx[0]];
 
 		for (auto i = 0u; i < uImageCount; ++i)
 		{
@@ -298,7 +331,7 @@ void NNModel::Convolution(uint32_t i)
 					const auto vNeuronPos = index<3>(i, vPos[0], vPos[1]);
 					const auto vKernelPos = index<3>(idx[0] * uImageCount + i, j, k);
 
-					fResult += iNeuronsRO[vNeuronPos] * iWeights[vKernelPos];
+					fResult += iNeuronsRO[vNeuronPos] * iWeightsRO[vKernelPos];
 				}
 			}
 		}
@@ -314,7 +347,7 @@ void NNModel::Convolution(uint32_t i)
 void NNModel::MaxPool(uint32_t i)
 {
 	if (m_layerData[i].m_uMaxPoolSize == 2) maxPool2x2(i);
-	else maxPool(i);
+	else if (m_layerData[i].m_uMaxPoolSize > 1) maxPool(i);
 }
 
 void NNModel::BackConvolution(uint32_t i, float fEta)
@@ -330,7 +363,7 @@ void NNModel::BackConvolution(uint32_t i, float fEta)
 	///////////////////////////////////////////////////////////////
 	auto &idEdysRW = *m_vdEdys[i - 1];
 	const auto &idEdysRO = *m_vdEdys[i];
-	const auto &iWeights = *m_vWeights[i];
+	const auto &iWeightsRO = *m_vWeights[i];
 
 	const auto vExtent = concurrency::extent<3>(
 		idEdysRW.extent[0],
@@ -342,7 +375,7 @@ void NNModel::BackConvolution(uint32_t i, float fEta)
 		// Define the compute domain, which is the set of threads that are created.
 		vExtent,
 		// Define the code to run on each thread on the accelerator.
-		[=, &idEdysRW, &idEdysRO, &iWeights](const index<3> idx) restrict(amp)
+		[=, &idEdysRW, &idEdysRO, &iWeightsRO](const index<3> idx) restrict(amp)
 	{
 		auto idx2D = index<2>(idx[1], idx[2]);
 
@@ -363,7 +396,7 @@ void NNModel::BackConvolution(uint32_t i, float fEta)
 						const auto vErrorPos = index<3>(i, vPos[0], vPos[1]);
 						const auto vKernelPos = index<3>(i * uImageCount + idx[0], j, k);
 
-						fResult += idEdysRO[vErrorPos] * iWeights[vKernelPos];
+						fResult += idEdysRO[vErrorPos] * iWeightsRO[vKernelPos];
 					}
 				}
 			}

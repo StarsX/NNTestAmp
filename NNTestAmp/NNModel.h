@@ -109,7 +109,7 @@ public:
 	void SetMaxPool(uint32_t i, int iSize);
 
 	void Execute();
-	void BackPropagate();
+	void BackPropagate(float fEta);
 
 	void Convolution(uint32_t i);
 	void MaxPool(uint32_t i);
