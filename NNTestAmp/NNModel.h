@@ -109,10 +109,12 @@ public:
 	void SetMaxPool(uint32_t i, int iSize);
 
 	void Execute();
-	void ExecuteLayer(uint32_t i, bool bMaxPool = false);
+	void BackPropagate();
+
+	void Convolution(uint32_t i);
 	void MaxPool(uint32_t i);
 
-	void BackLayer(uint32_t i);
+	void BackConvolution(uint32_t i, float fEta);
 
 	void PrintLayerData();
 
@@ -123,7 +125,7 @@ protected:
 	{
 		uint32_t m_uStride = 2;
 		uint32_t m_uKernelSize;
-		uint32_t m_uMaxPoolSize;
+		uint32_t m_uMaxPoolSize = 1;
 		
 		uint32_t m_uImageCount = 1;	// Input image count (number of input image/neurons from the previous layer)
 		uint32_t m_uMapCount;
@@ -131,12 +133,12 @@ protected:
 
 	concurrency::graphics::int_2 calculateFeatureMapSizeFromKernel(uint32_t i, int iKernelSize, uint32_t uStride) const;
 
-	void maxPool(uint32_t i);
-	void maxPool2x2(uint32_t i);
+	void maxPool(uint32_t i);		// General max pooling
+	void maxPool2x2(uint32_t i);	// Fast 2x2 max pooling
 
 	vpAmpImage2DArray<float>	m_vFeatureMaps;
 	vpAmpImage2DArray<float>	m_vMaxPools;
-	vpAmpImage2DArray<float>	m_vErrors;
+	vpAmpImage2DArray<float>	m_vdEdys;
 
 	vpAmpImage2DArray<float>	m_vWeights;
 	vpAmpArray<float>			m_vBias;

@@ -14,6 +14,8 @@ using namespace precise_math;
 NNModel::NNModel(uint32_t uLayerCount) :
 	m_uLayerCount(uLayerCount),
 	m_vFeatureMaps(uLayerCount),
+	m_vMaxPools(uLayerCount),
+	m_vdEdys(uLayerCount),
 	m_vWeights(uLayerCount),
 	m_vBias(uLayerCount),
 	m_layerData(uLayerCount)
@@ -214,6 +216,7 @@ void NNModel::SetLayer(uint32_t i, const vector<float> &vWeights, const vector<f
 void NNModel::SetFeatureMap(uint32_t i, int iWidth, int iHeight, int iNum)
 {
 	m_vFeatureMaps[i] = make_shared<AmpImage2DArray<float>>(iNum, iHeight, iWidth);
+	m_vdEdys[i] = make_shared<AmpImage2DArray<float>>(iNum, iHeight, iWidth);
 	m_layerData[i].m_uMapCount = iNum;
 
 	if (++i < m_uLayerCount) m_layerData[i].m_uImageCount = iNum;
@@ -259,30 +262,31 @@ void NNModel::SetMaxPool(uint32_t i, int iSize)
 
 void NNModel::Execute()
 {
-	for (auto i = 0u; i < m_uLayerCount; ++i) ExecuteLayer(i);
+	for (auto i = 0u; i < m_uLayerCount; ++i) Convolution(i);
 }
 
-void NNModel::ExecuteLayer(uint32_t i, bool bMaxPool)
+void NNModel::Convolution(uint32_t i)
 {
-	auto &iNeuronsRW = *m_vFeatureMaps[i];
-	const auto ivNeuronsRO = AmpImage2DArrayView<float>(*(i > 0 ? (bMaxPool ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages));
-
-	const auto ivWeights = AmpImage2DArrayView<float>(*m_vWeights[i]);
-	const auto avBias = AmpArrayView<float>(*m_vBias[i]);
-
 	const auto uStride = m_layerData[i].m_uStride;
 	const auto uKernelSize = m_layerData[i].m_uKernelSize;
 	const auto uImageCount = m_layerData[i].m_uImageCount;
+	const auto uMaxPoolSize = i > 0 ? m_layerData[i - 1].m_uMaxPoolSize : 1;
+
+	auto &iNeuronsRW = *m_vFeatureMaps[i];
+	const auto &iNeuronsRO = *(i > 0 ? (uMaxPoolSize > 1 ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages);
+
+	const auto &iWeights = *m_vWeights[i];
+	const auto &aBias = *m_vBias[i];
 
 	parallel_for_each(
 		// Define the compute domain, which is the set of threads that are created.
 		iNeuronsRW.extent,
 		// Define the code to run on each thread on the accelerator.
-		[=, &iNeuronsRW](const index<3> idx) restrict(amp)
+		[=, &iNeuronsRW, &iNeuronsRO, &iWeights, &aBias](const index<3> idx) restrict(amp)
 	{
-		const auto vWinPos = index<3>(idx * uStride);
+		const auto vWinPos = index<2>(idx[1], idx[2]) * uStride;
 
-		auto fResult = avBias[idx[0]];
+		auto fResult = aBias[idx[0]];
 
 		for (auto i = 0u; i < uImageCount; ++i)
 		{
@@ -291,10 +295,11 @@ void NNModel::ExecuteLayer(uint32_t i, bool bMaxPool)
 			{
 				for (auto k = 0u; k < uKernelSize; ++k)
 				{
-					const auto vCKPos = index<3>(idx[0] * uImageCount + i, j, k);
-					const auto vPos = vWinPos + vCKPos;
-					const auto vNPos = index<3>(i, vPos[1], vPos[2]);
-					fResult += ivNeuronsRO[vNPos] * ivWeights[vCKPos];
+					const auto vPos = vWinPos + index<2>(j, k);
+					const auto vNeuronPos = index<3>(i, vPos[0], vPos[1]);
+					const auto vKernelPos = index<3>(idx[0] * uImageCount + i, j, k);
+
+					fResult += iNeuronsRO[vNeuronPos] * iWeights[vKernelPos];
 				}
 			}
 		}
@@ -310,46 +315,107 @@ void NNModel::ExecuteLayer(uint32_t i, bool bMaxPool)
 void NNModel::MaxPool(uint32_t i)
 {
 	if (m_layerData[i].m_uMaxPoolSize == 2) maxPool2x2(i);
-	// else maxPool(i);
+	else maxPool(i);
 }
 
-void NNModel::BackLayer(uint32_t i)
+void NNModel::BackConvolution(uint32_t i, float fEta)
 {
-	// Evaluate the errors (dE/dy) for the previous layer
-	auto &iErrorRW = *m_vErrors[i - 1];
-	const auto ivErrorRO = AmpImage2DArrayView<float>(*m_vErrors[i]);
-	const auto ivWeights = AmpImage2DArrayView<float>(*m_vWeights[i]);
-
 	const auto uStride = m_layerData[i].m_uStride;
 	const auto uKernelSize = m_layerData[i].m_uKernelSize;
 	const auto uImageCount = m_layerData[i].m_uImageCount;
+	const auto uMapCount = m_layerData[i].m_uMapCount;
+	const auto uMaxPoolSize = i > 0 ? m_layerData[i - 1].m_uMaxPoolSize : 1;
+
+	///////////////////////////////////////////////////////////////
+	// Pass 1: Evaluate the errors (dE/dy) for the previous layer
+	///////////////////////////////////////////////////////////////
+	auto &idEdysRW = *m_vdEdys[i - 1];
+	const auto &idEdysRO = *m_vdEdys[i];
+	const auto &iWeights = *m_vWeights[i];
+
+	const auto vExtent = concurrency::extent<3>(
+		idEdysRW.extent[0],
+		idEdysRW.extent[1] / uMaxPoolSize,
+		idEdysRW.extent[2] / uMaxPoolSize
+		);
 
 	parallel_for_each(
 		// Define the compute domain, which is the set of threads that are created.
-		iErrorRW.extent,
+		vExtent,
 		// Define the code to run on each thread on the accelerator.
-		[=, &iErrorRW](const index<3> idx) restrict(amp)
+		[=, &idEdysRW, &idEdysRO, &iWeights](const index<3> idx) restrict(amp)
 	{
-		const auto vWinPos = index<3>(idx * uStride);
+		auto idx2D = index<2>(idx[1], idx[2]);
 
 		auto fResult = 0.0f;
 
-		for (auto i = 0u; i < uImageCount; ++i)
+		for (auto i = 0u; i < uMapCount; ++i)
 		{
 			// Convolution
 			for (auto j = 0u; j < uKernelSize; ++j)
 			{
 				for (auto k = 0u; k < uKernelSize; ++k)
 				{
-					const auto vCKPos = index<3>(idx[0] * uImageCount + i, j, k);
-					const auto vPos = vWinPos + vCKPos;
-					const auto vNPos = index<3>(i, vPos[1], vPos[2]);
-					fResult += ivErrorRO[vNPos] * ivWeights[vCKPos];
+					const auto vKernelPos2D = index<2>(j, k);
+					const auto vPos = (idx2D - vKernelPos2D) / uStride;
+
+					if (vPos * uStride + vKernelPos2D == idx2D)
+					{
+						const auto vErrorPos = index<3>(i, vPos[0], vPos[1]);
+						const auto vKernelPos = index<3>(i * uImageCount + idx[0], j, k);
+
+						fResult += idEdysRO[vErrorPos] * iWeights[vKernelPos];
+					}
 				}
 			}
-
-
 		}
+
+		// If there is max pooling, up-sampling is neccessary
+		idx2D *= uMaxPoolSize;
+		for (auto i = 0u; i < uMaxPoolSize; ++i)
+		{
+			for (auto j = 0u; j < uMaxPoolSize; ++j)
+			{
+				const auto vPos = idx2D + index<2>(i, j);
+				const auto vEPos = index<3>(idx[0], vPos[0], vPos[1]);
+
+				idEdysRW[vEPos] = fResult;
+			}
+		}
+	}
+	);
+
+	///////////////////////////////////////////////////////////////
+	// Pass 2: Update weights
+	///////////////////////////////////////////////////////////////
+	auto &iWeightsRW = *m_vWeights[i];
+	const auto &iNeuronsRO = *(i > 0 ? (uMaxPoolSize > 1 ? m_vMaxPools : m_vFeatureMaps)[i - 1] : m_pImages);
+
+	parallel_for_each(
+		// Define the compute domain, which is the set of threads that are created.
+		iWeightsRW.extent,
+		// Define the code to run on each thread on the accelerator.
+		[=, &iWeightsRW, &idEdysRO, &iNeuronsRO](const index<3> idx) restrict(amp)
+	{
+		const auto uNeuronIdx = idx[0] % uImageCount;
+		const auto uErrorIdx = idx[0] / uImageCount;
+
+		auto fdEdW = 0.0f;
+
+		for (auto i = 0; i < idEdysRO.get_extent()[1]; ++i)
+		{
+			for (auto j = 0; j < idEdysRO.get_extent()[2]; ++j)
+			{
+				const auto vWinPos = index<2>(i, j) * uStride;
+				const auto vPos = vWinPos + index<2>(idx[1], idx[2]);
+				const auto vNeuronPos = index<3>(uNeuronIdx, vPos[0], vPos[1]);
+				const auto vErrorPos = index<3>(uErrorIdx, i, j);
+
+				fdEdW += iNeuronsRO[vNeuronPos] * idEdysRO[vErrorPos];
+			}
+		}
+		
+		iWeightsRW[idx] -= fEta * fdEdW;
 	}
 	);
 }
@@ -378,32 +444,66 @@ int2 NNModel::calculateFeatureMapSizeFromKernel(uint32_t i, int iKernelSize, uin
 	return int2(iWidth, iHeight);
 }
 
+void NNModel::maxPool(uint32_t i)
+{
+	const auto uMaxPoolSize = m_layerData[i].m_uMaxPoolSize;
+
+	auto& iNeuronsRW = *m_vMaxPools[i];
+	const auto &iNeuronsRO = *m_vFeatureMaps[i - 1];
+
+	// nxn down sampling with max-filter
+	parallel_for_each(
+		// Define the compute domain, which is the set of threads that are created.
+		iNeuronsRW.extent,
+		// Define the code to run on each thread on the accelerator.
+		[=, &iNeuronsRW, &iNeuronsRO](const index<3> idx) restrict(amp)
+	{
+		const auto vWinPos = index<2>(idx[1], idx[2]) * uMaxPoolSize;
+
+		auto fResult = -FLT_MAX;
+
+		for (auto i = 0u; i < uMaxPoolSize; ++i)
+		{
+			for (auto j = 0u; j < uMaxPoolSize; ++j)
+			{
+				const auto vPos = vWinPos + index<2>(i, j);
+				const auto vNeuronPos = index<3>(idx[0], vPos[0], vPos[1]);
+
+				fResult = fmax(iNeuronsRO[vNeuronPos], fResult);
+			}
+		}
+
+		iNeuronsRW[idx] = fResult;
+	}
+	);
+}
+
 void NNModel::maxPool2x2(uint32_t i)
 {
 	auto& iNeuronsRW = *m_vMaxPools[i];
-	const auto ivNeuronsRO = AmpImage2DArrayView<float>(*m_vFeatureMaps[i - 1]);
+	const auto &iNeuronsRO = *m_vFeatureMaps[i - 1];
 
 	// Fast 2x2 down sampling with max-filter
 	parallel_for_each(
 		// Define the compute domain, which is the set of threads that are created.
-		ivNeuronsRO.extent.tile<1, 2, 2>(),
+		iNeuronsRO.extent.tile<1, 2, 2>(),
 		// Define the code to run on each thread on the accelerator.
-		[=, &iNeuronsRW](const tiled_index<1, 2, 2> t_idx) restrict(amp)
+		[=, &iNeuronsRW, &iNeuronsRO](const tiled_index<1, 2, 2> t_idx) restrict(amp)
 	{
 		// Group (tile)-shared memory
 		tile_static float fPool[2][2];
-		auto &fPoolCur = fPool[t_idx.local[1]][t_idx.local[2]];
+		auto &fResult = fPool[t_idx.local[1]][t_idx.local[2]];
 
-		fPoolCur = ivNeuronsRO[t_idx];
+		fResult = iNeuronsRO[t_idx];
 		t_idx.barrier.wait();
 
 		// Take max in binary
-		fPoolCur = t_idx.local[2] ? fmax(fPoolCur, fPool[t_idx.local[1]][t_idx.local[2] - 1]) : fPoolCur;
-		fPoolCur = t_idx.local[1] ? fmax(fPoolCur, fPool[t_idx.local[1] - 1][t_idx.local[2]]) : fPoolCur;
+		fResult = t_idx.local[2] ? fmax(fResult, fPool[t_idx.local[1]][t_idx.local[2] - 1]) : fResult;
+		fResult = t_idx.local[1] ? fmax(fResult, fPool[t_idx.local[1] - 1][t_idx.local[2]]) : fResult;
 
 		if (t_idx.local[1] && t_idx.local[2])
 		{
-			iNeuronsRW[t_idx.tile] = fPoolCur;
+			iNeuronsRW[t_idx.tile] = fResult;
 		}
 	}
 	);
